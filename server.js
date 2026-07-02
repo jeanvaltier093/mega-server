@@ -1,3 +1,4 @@
+
 'use strict';
 const express = require('express');
 const app = express();
@@ -270,6 +271,19 @@ app.get('/status', (req, res) => {
  
 app.get('/combos', (req, res) => {
     res.json(COMBOS);
+});
+ 
+app.post('/reset', async (req, res) => {
+    try {
+        await fetch(`${FIREBASE_URL}/mega/signals.json`, { method: 'DELETE' });
+        await fetch(`${FIREBASE_URL}/mega/lastSignalTime.json`, { method: 'DELETE' });
+        lastScanResults = { timestamp: null, signals: [] };
+        console.log(`[${new Date().toISOString()}] Reset effectué: signals + lastSignalTime supprimés.`);
+        res.json({ status: 'ok', message: 'signals et lastSignalTime supprimés' });
+    } catch (e) {
+        console.error('Erreur reset:', e.message);
+        res.status(500).json({ status: 'error', message: e.message });
+    }
 });
  
 app.listen(PORT, () => {
