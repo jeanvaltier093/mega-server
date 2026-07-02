@@ -1,4 +1,3 @@
-
 'use strict';
 const express = require('express');
 const app = express();
@@ -273,7 +272,7 @@ app.get('/combos', (req, res) => {
     res.json(COMBOS);
 });
  
-app.post('/reset', async (req, res) => {
+app.all('/reset', async (req, res) => {
     try {
         await fetch(`${FIREBASE_URL}/mega/signals.json`, { method: 'DELETE' });
         await fetch(`${FIREBASE_URL}/mega/lastSignalTime.json`, { method: 'DELETE' });
