@@ -38,6 +38,24 @@ function isWithinActiveHours() {
     return heureParis >= ACTIVE_HOUR_START && heureParis < ACTIVE_HOUR_END;
 }
  
+// Le marché forex est fermé le week-end (du vendredi ~22h au dimanche ~23h
+// Paris). Sans cette protection, MEGA générait des signaux le samedi/dimanche
+// et pouvait même les "clôturer" sur des bougies week-end non fiables que
+// Twelve Data renvoie quand même (données figées / micro-mouvements
+// résiduels), d'où des trades apparus ET clôturés le week-end.
+function isMarketOpen() {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/Paris', weekday: 'short', hour: '2-digit', hour12: false
+    }).formatToParts(new Date());
+    const jour = parts.find(p => p.type === 'weekday').value; // Mon..Sun
+    const heure = parseInt(parts.find(p => p.type === 'hour').value, 10);
+ 
+    if (jour === 'Sat') return false;                    // samedi: fermé toute la journée
+    if (jour === 'Sun' && heure < 23) return false;      // dimanche: fermé jusqu'à 23h (réouverture)
+    if (jour === 'Fri' && heure >= 22) return false;     // vendredi: fermé à partir de 22h
+    return true;
+}
+ 
 /*
  * Récupère les bougies pour chaque (paire, timeframe) UNIQUE nécessaire —
  * une seule requête Twelve Data par combinaison, même si plusieurs combos
@@ -120,6 +138,13 @@ async function fetchCandlesSince(pair, sinceMs, interval = '15min') {
  * au-dela de l'autre avant le scan suivant.
  */
 async function checkTrades() {
+    // Pas de vérification le week-end: Twelve Data renvoie des bougies non
+    // fiables (marché fermé), qui pouvaient déclencher de fausses clôtures.
+    if (!isMarketOpen()) {
+        console.log(`[${new Date().toISOString()}] Marché fermé (week-end), vérification des trades ignorée.`);
+        return;
+    }
+ 
     let activeSignals;
     try {
         const r = await fetch(`${FIREBASE_URL}/mega/signals.json`);
@@ -199,10 +224,15 @@ async function checkTrades() {
 }
  
 async function runScan() {
-    // La vérification des trades actifs tourne à chaque tick, même hors
-    // fenêtre 8h-22h — le marché forex bouge 24h/24 en semaine, un TP/SL
-    // peut être touché à n'importe quelle heure.
+    // La vérification des trades actifs tourne à chaque tick — checkTrades()
+    // gère lui-même le blocage week-end en interne.
     await checkTrades();
+ 
+    // Pas de nouveaux signaux le week-end (marché forex fermé).
+    if (!isMarketOpen()) {
+        console.log(`[${new Date().toISOString()}] Marché fermé (week-end), scan de nouveaux signaux ignoré.`);
+        return;
+    }
  
     if (!isWithinActiveHours()) {
         console.log(`[${new Date().toISOString()}] Hors fenêtre active (${ACTIVE_HOUR_START}h-${ACTIVE_HOUR_END}h Paris), scan ignoré.`);
