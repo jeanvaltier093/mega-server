@@ -97,29 +97,20 @@ async function fetchAllCandles() {
 const FIREBASE_URL = process.env.FIREBASE_URL || 'https://forex-trading-bendo-default-rtdb.firebaseio.com';
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || '80ddd35489f3427d8c43f29c995d6372';
  
-async function fetchCandlesSince(pair, sinceMs, interval = '15min') {
+async function fetchCurrentPrice(pair) {
     await waitForRateLimit();
-    const start = new Date(sinceMs);
-    const fmt = d => d.toISOString().slice(0, 19).replace('T', ' ');
-    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(pair)}&interval=${interval}&start_date=${encodeURIComponent(fmt(start))}&outputsize=500&apikey=${TWELVE_DATA_API_KEY}&format=JSON&timezone=UTC`;
+    const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(pair)}&apikey=${TWELVE_DATA_API_KEY}`;
     const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
     const d = await r.json();
-    if (!d.values || d.status === 'error') throw new Error(d.message || 'Pas de données retournées');
-    // Chronologique (ancien -> récent), on retire la dernière bougie qui peut
-    // être encore en cours de formation (high/low provisoires).
-    return d.values.reverse().slice(0, -1);
+    if (!d.price) throw new Error(`Pas de prix retourné pour ${pair}: ${JSON.stringify(d)}`);
+    return parseFloat(d.price);
 }
  
 /*
- * Relit les trades actifs (result null/absent) depuis Firebase, et vérifie
- * chaque bougie M15 depuis l'ouverture, DANS L'ORDRE CHRONOLOGIQUE, pour
- * trouver quel niveau (TP ou SL) a été touché EN PREMIER.
- *
- * Version précédente: ne vérifiait que le prix "actuel" au moment du scan.
- * Ça causait des erreurs quand le prix touchait un niveau puis rebondissait
- * au-delà de l'autre avant le scan suivant — on ne voyait que l'état final,
- * pas l'ordre réel des événements (8 clôtures erronées détectées à l'audit,
- * toutes sur MEGA, aucune sur PROD qui utilise déjà cette méthode).
+ * Relit les trades actifs (result null/absent) depuis Firebase, vérifie leur
+ * prix courant contre TP/SL, et clôture ceux qui ont été touchés.
+ * Passe par le même limiteur à fenêtre glissante que le scan de signaux —
+ * pas de budget Twelve Data séparé.
  */
 async function checkTrades() {
     let activeSignals;
@@ -140,64 +131,53 @@ async function checkTrades() {
  
     console.log(`[${new Date().toISOString()}] Vérification de ${activeSignals.length} trade(s) actif(s)...`);
  
+    // Les paires sont stockées avec underscore (USD_JPY) au lieu de slash
+    // (USD/JPY) — même encodage que pour lastSignalTime, nécessaire pour
+    // Firebase qui interdit "/" dans les clés. On décode ici pour interroger
+    // Twelve Data avec le vrai symbole.
     const decodePair = p => p.replace('_', '/');
  
-    // Un seul fetch de bougies par paire (depuis l'entrée la plus ancienne
-    // parmi les trades actifs sur cette paire), même si plusieurs trades
-    // actifs partagent la paire.
-    const byPair = {};
-    for (const s of activeSignals) {
-        const pair = decodePair(s.pair);
-        (byPair[pair] = byPair[pair] || []).push(s);
+    // Un seul fetch de prix par paire, même si plusieurs trades actifs partagent la paire
+    const pairsNeeded = [...new Set(activeSignals.map(s => decodePair(s.pair)))];
+    const pricesByPair = {};
+    for (const pair of pairsNeeded) {
+        try {
+            pricesByPair[pair] = await fetchCurrentPrice(pair);
+        } catch (e) {
+            console.error(`checkTrades: erreur prix ${pair}:`, e.message);
+        }
     }
  
-    for (const [pair, signals] of Object.entries(byPair)) {
-        const earliestTs = Math.min(...signals.map(s => new Date(s.timestamp).getTime()));
-        let candles;
-        try {
-            candles = await fetchCandlesSince(pair, earliestTs);
-        } catch (e) {
-            console.error(`checkTrades: erreur bougies ${pair}:`, e.message);
-            continue;
+    for (const signal of activeSignals) {
+        const currentPrice = pricesByPair[decodePair(signal.pair)];
+        if (currentPrice === undefined) continue;
+ 
+        const tp = parseFloat(signal.tp);
+        const sl = parseFloat(signal.sl);
+        let result = null, closePrice = null;
+ 
+        if (signal.direction === 'BUY') {
+            if (currentPrice >= tp) { result = 'WIN'; closePrice = tp; }
+            else if (currentPrice <= sl) { result = 'LOSS'; closePrice = sl; }
+        } else {
+            if (currentPrice <= tp) { result = 'WIN'; closePrice = tp; }
+            else if (currentPrice >= sl) { result = 'LOSS'; closePrice = sl; }
         }
-        if (!candles.length) continue;
  
-        for (const signal of signals) {
-            const entryTs = new Date(signal.timestamp).getTime();
-            const postEntry = candles.filter(c => new Date(c.datetime).getTime() > entryTs);
-            if (!postEntry.length) continue;
- 
-            const tp = parseFloat(signal.tp);
-            const sl = parseFloat(signal.sl);
-            let result = null, closePrice = null, closeDate = null;
- 
-            for (const c of postEntry) {
-                const high = parseFloat(c.high);
-                const low = parseFloat(c.low);
-                if (signal.direction === 'BUY') {
-                    if (high >= tp) { result = 'WIN'; closePrice = tp; closeDate = c.datetime; break; }
-                    if (low <= sl) { result = 'LOSS'; closePrice = sl; closeDate = c.datetime; break; }
-                } else {
-                    if (low <= tp) { result = 'WIN'; closePrice = tp; closeDate = c.datetime; break; }
-                    if (high >= sl) { result = 'LOSS'; closePrice = sl; closeDate = c.datetime; break; }
-                }
-            }
- 
-            if (result) {
-                try {
-                    await fetch(`${FIREBASE_URL}/mega/signals/${signal._fbKey}.json`, {
-                        method: 'PATCH',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            result,
-                            closePrice,
-                            closedAt: new Date(closeDate).toISOString(),
-                        }),
-                    });
-                    console.log(`  ${result === 'WIN' ? '✅' : '❌'} ${pair} ${signal.direction} clôturé — ${result} @ ${closePrice} (bougie ${closeDate})`);
-                } catch (e) {
-                    console.error(`checkTrades: erreur écriture clôture ${pair}:`, e.message);
-                }
+        if (result) {
+            try {
+                await fetch(`${FIREBASE_URL}/mega/signals/${signal._fbKey}.json`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        result,
+                        closePrice,
+                        closedAt: new Date().toISOString(),
+                    }),
+                });
+                console.log(`  ${result === 'WIN' ? '✅' : '❌'} ${signal.pair} ${signal.direction} clôturé — ${result} @ ${closePrice}`);
+            } catch (e) {
+                console.error(`checkTrades: erreur écriture clôture ${signal.pair}:`, e.message);
             }
         }
     }
@@ -303,6 +283,95 @@ app.all('/reset', async (req, res) => {
         console.error('Erreur reset:', e.message);
         res.status(500).json({ status: 'error', message: e.message });
     }
+});
+ 
+app.all('/recheck-all', async (req, res) => {
+    // Re-vérifie TOUS les trades déjà clôturés (result WIN/LOSS) avec la
+    // logique chronologique par bougies, et corrige ceux dont le résultat
+    // stocké ne correspond pas à ce qui s'est réellement passé sur le marché.
+    // Utile pour rattraper les clôtures erronées produites par l'ancienne
+    // méthode "prix instantané". À appeler une fois, puis laisser.
+    let signals;
+    try {
+        const r = await fetch(`${FIREBASE_URL}/mega/signals.json`);
+        const data = await r.json();
+        signals = data
+            ? Object.entries(data)
+                  .filter(([, s]) => s.result === 'WIN' || s.result === 'LOSS')
+                  .map(([key, s]) => ({ ...s, _fbKey: key }))
+            : [];
+    } catch (e) {
+        return res.status(500).json({ status: 'error', message: e.message });
+    }
+ 
+    const decodePair = p => p.replace('_', '/');
+    const corrections = [];
+    let checked = 0, errors = 0;
+ 
+    // Regroupe par paire pour minimiser les requêtes
+    const byPair = {};
+    for (const s of signals) {
+        const pair = decodePair(s.pair);
+        (byPair[pair] = byPair[pair] || []).push(s);
+    }
+ 
+    for (const [pair, sigs] of Object.entries(byPair)) {
+        const earliestTs = Math.min(...sigs.map(s => new Date(s.timestamp).getTime()));
+        let candles;
+        try {
+            candles = await fetchCandlesSince(pair, earliestTs);
+        } catch (e) {
+            errors++;
+            console.error(`recheck-all: erreur bougies ${pair}:`, e.message);
+            continue;
+        }
+        if (!candles.length) continue;
+ 
+        for (const signal of sigs) {
+            checked++;
+            const entryTs = new Date(signal.timestamp).getTime();
+            const postEntry = candles.filter(c => new Date(c.datetime).getTime() > entryTs);
+            if (!postEntry.length) continue;
+ 
+            const tp = parseFloat(signal.tp);
+            const sl = parseFloat(signal.sl);
+            let trueResult = null, closePrice = null, closeDate = null;
+ 
+            for (const c of postEntry) {
+                const high = parseFloat(c.high);
+                const low = parseFloat(c.low);
+                if (signal.direction === 'BUY') {
+                    if (high >= tp) { trueResult = 'WIN'; closePrice = tp; closeDate = c.datetime; break; }
+                    if (low <= sl) { trueResult = 'LOSS'; closePrice = sl; closeDate = c.datetime; break; }
+                } else {
+                    if (low <= tp) { trueResult = 'WIN'; closePrice = tp; closeDate = c.datetime; break; }
+                    if (high >= sl) { trueResult = 'LOSS'; closePrice = sl; closeDate = c.datetime; break; }
+                }
+            }
+ 
+            if (trueResult && trueResult !== signal.result) {
+                try {
+                    await fetch(`${FIREBASE_URL}/mega/signals/${signal._fbKey}.json`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            result: trueResult,
+                            closePrice,
+                            closedAt: new Date(closeDate).toISOString(),
+                        }),
+                    });
+                    corrections.push({ pair, direction: signal.direction, ancien: signal.result, corrige: trueResult, date: closeDate });
+                    console.log(`  🔧 CORRIGÉ ${pair} ${signal.direction}: ${signal.result} → ${trueResult} (bougie ${closeDate})`);
+                } catch (e) {
+                    errors++;
+                    console.error(`recheck-all: erreur écriture ${pair}:`, e.message);
+                }
+            }
+        }
+    }
+ 
+    console.log(`[${new Date().toISOString()}] Recheck-all terminé: ${checked} vérifiés, ${corrections.length} corrigés, ${errors} erreurs.`);
+    res.json({ status: 'ok', verifies: checked, corriges: corrections.length, erreurs: errors, corrections });
 });
  
 app.listen(PORT, () => {
