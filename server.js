@@ -2,7 +2,7 @@
 const express = require('express');
 const app = express();
 app.use(express.json());
- 
+
 // ─── CORS ─────────────────────────────────────────────────
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -11,22 +11,60 @@ app.use((req, res, next) => {
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
- 
+
 const { COMBOS, PAIRS, PAIR_TIMEFRAMES } = require('./combos.js');
 const { fetchCandles } = require('./twelvedata.js');
 const { computeAllSignals, comboMatches, computeSlTp } = require('./signal_engine.js');
 const { logSignal, getLastSignalTime, setLastSignalTime } = require('./firebase.js');
- 
+
 const PORT = process.env.PORT || 10000;
 const SCAN_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes — calibré sur le quota Twelve Data (voir analyse: ~560 req/jour sur 800, 30% de marge)
 const ACTIVE_HOUR_START = 8;  // heure Paris (Europe/Paris, gère heure d'été/hiver automatiquement) de début de fenêtre active
 const ACTIVE_HOUR_END = 22;   // heure Paris de fin de fenêtre active
 const MIN_RESCAN_GAP_MS = 60 * 60 * 1000; // anti-duplication: pas 2 fois le même signal en moins d'1h
- 
+
+// ─── FILTRE SL MINIMUM (protection contre le spread) ──────────────────────────
+// Le spread est un coût FIXE en pips. Sur un SL serré il représente une part
+// énorme du risque et détruit le ratio réel:
+//   SL 3.6 pips + spread 0.7  -> ratio réel 1:1.09 (au lieu de 1:1.50)
+//   SL 20  pips + spread 0.7  -> ratio réel 1:1.42 (quasi intact)
+// Comme SL = 1.5 x ATR, un marché calme (ATR faible) produit un SL minuscule
+// sur lequel la stratégie n'a mathématiquement AUCUN edge, même si le signal
+// est bon.
+//
+// On NE MODIFIE PAS la formule SL/TP (sinon on casse la comparabilité avec le
+// backtest MegaExplorer): on se contente de REJETER le signal quand le SL est
+// trop serré face au spread. Les trades pris restent identiques à ceux du
+// backtest, on en écarte juste une catégorie sans edge.
+//
+// Seuil: SL >= 10 x spread, ce qui garde le WR breakeven sous ~44%.
+const SPREADS_PIPS = {
+    EUR_USD: 0.6,
+    GBP_USD: 0.9,
+    USD_JPY: 0.7,
+    USD_CHF: 1.5,
+    AUD_USD: 0.7,
+    USD_CAD: 1.7,
+    NZD_USD: 1.0,
+    EUR_GBP: 0.9,
+};
+const SL_SPREAD_MULTIPLE = 10;
+
+function minSlPips(pairKey) {
+    const spread = SPREADS_PIPS[pairKey];
+    if (spread === undefined) return 0; // paire inconnue: pas de filtre
+    return spread * SL_SPREAD_MULTIPLE;
+}
+
+function slDistancePips(pairKey, entry, sl) {
+    const pipSize = pairKey.endsWith('JPY') ? 0.01 : 0.0001;
+    return Math.abs(entry - sl) / pipSize;
+}
+
 let lastScanResults = { timestamp: null, signals: [] };
 let scanCount = 0;
 let errorCount = 0;
- 
+
 function isWithinActiveHours() {
     // Utilise Europe/Paris (pas un décalage UTC fixe) pour gérer
     // automatiquement le changement heure d'été/hiver — un décalage fixe
@@ -37,7 +75,7 @@ function isWithinActiveHours() {
     );
     return heureParis >= ACTIVE_HOUR_START && heureParis < ACTIVE_HOUR_END;
 }
- 
+
 // Le marché forex est fermé le week-end (du vendredi ~22h au dimanche ~23h
 // Paris). Sans cette protection, MEGA générait des signaux le samedi/dimanche
 // et pouvait même les "clôturer" sur des bougies week-end non fiables que
@@ -49,13 +87,13 @@ function isMarketOpen() {
     }).formatToParts(new Date());
     const jour = parts.find(p => p.type === 'weekday').value; // Mon..Sun
     const heure = parseInt(parts.find(p => p.type === 'hour').value, 10);
- 
+
     if (jour === 'Sat') return false;                    // samedi: fermé toute la journée
     if (jour === 'Sun' && heure < 23) return false;      // dimanche: fermé jusqu'à 23h (réouverture)
     if (jour === 'Fri' && heure >= 22) return false;     // vendredi: fermé à partir de 22h
     return true;
 }
- 
+
 /*
  * Récupère les bougies pour chaque (paire, timeframe) UNIQUE nécessaire —
  * une seule requête Twelve Data par combinaison, même si plusieurs combos
@@ -64,7 +102,7 @@ function isMarketOpen() {
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
- 
+
 // Limiteur à fenêtre glissante: au lieu d'espacer chaque requête d'un délai
 // fixe (prudent mais lent), on autorise les requêtes à partir tout de suite
 // tant qu'on est sous la limite, et on ne freine que quand la fenêtre des
@@ -79,7 +117,7 @@ const RATE_LIMIT_WINDOW_MS = 61000;
 // simultanées on reste à 8, tout juste à la limite réelle.
 const RATE_LIMIT_MAX_REQUESTS = 4;
 const requestTimestamps = [];
- 
+
 async function waitForRateLimit() {
     const now = Date.now();
     while (requestTimestamps.length && now - requestTimestamps[0] > RATE_LIMIT_WINDOW_MS) {
@@ -92,7 +130,7 @@ async function waitForRateLimit() {
     }
     requestTimestamps.push(Date.now());
 }
- 
+
 async function fetchAllCandles() {
     const candlesByPairTf = {};
     for (const [pair, tfs] of Object.entries(PAIR_TIMEFRAMES)) {
@@ -111,10 +149,10 @@ async function fetchAllCandles() {
     }
     return candlesByPairTf;
 }
- 
+
 const FIREBASE_URL = process.env.FIREBASE_URL || 'https://forex-trading-bendo-default-rtdb.firebaseio.com';
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || '80ddd35489f3427d8c43f29c995d6372';
- 
+
 async function fetchCandlesSince(pair, sinceMs, interval = '15min') {
     await waitForRateLimit();
     const start = new Date(sinceMs);
@@ -127,7 +165,7 @@ async function fetchCandlesSince(pair, sinceMs, interval = '15min') {
     // etre encore en cours de formation (high/low provisoires).
     return d.values.reverse().slice(0, -1);
 }
- 
+
 /*
  * Relit les trades actifs (result null/absent) depuis Firebase, et verifie
  * chaque bougie M15 depuis l'ouverture, DANS L'ORDRE CHRONOLOGIQUE, pour
@@ -144,7 +182,7 @@ async function checkTrades() {
         console.log(`[${new Date().toISOString()}] Marché fermé (week-end), vérification des trades ignorée.`);
         return;
     }
- 
+
     let activeSignals;
     try {
         const r = await fetch(`${FIREBASE_URL}/mega/signals.json`);
@@ -158,19 +196,19 @@ async function checkTrades() {
         console.error('checkTrades: erreur lecture Firebase:', e.message);
         return;
     }
- 
+
     if (!activeSignals.length) return;
- 
+
     console.log(`[${new Date().toISOString()}] Verification de ${activeSignals.length} trade(s) actif(s)...`);
- 
+
     const decodePair = p => p.replace('_', '/');
- 
+
     const byPair = {};
     for (const s of activeSignals) {
         const pair = decodePair(s.pair);
         (byPair[pair] = byPair[pair] || []).push(s);
     }
- 
+
     for (const [pair, signals] of Object.entries(byPair)) {
         const earliestTs = Math.min(...signals.map(s => new Date(s.timestamp).getTime()));
         let candles;
@@ -181,16 +219,16 @@ async function checkTrades() {
             continue;
         }
         if (!candles.length) continue;
- 
+
         for (const signal of signals) {
             const entryTs = new Date(signal.timestamp).getTime();
             const postEntry = candles.filter(c => new Date(c.datetime).getTime() > entryTs);
             if (!postEntry.length) continue;
- 
+
             const tp = parseFloat(signal.tp);
             const sl = parseFloat(signal.sl);
             let result = null, closePrice = null, closeDate = null;
- 
+
             for (const c of postEntry) {
                 const high = parseFloat(c.high);
                 const low = parseFloat(c.low);
@@ -202,7 +240,7 @@ async function checkTrades() {
                     if (high >= sl) { result = 'LOSS'; closePrice = sl; closeDate = c.datetime; break; }
                 }
             }
- 
+
             if (result) {
                 try {
                     await fetch(`${FIREBASE_URL}/mega/signals/${signal._fbKey}.json`, {
@@ -222,39 +260,45 @@ async function checkTrades() {
         }
     }
 }
- 
+
 async function runScan() {
     // La vérification des trades actifs tourne à chaque tick — checkTrades()
     // gère lui-même le blocage week-end en interne.
     await checkTrades();
- 
+
     // Pas de nouveaux signaux le week-end (marché forex fermé).
     if (!isMarketOpen()) {
         console.log(`[${new Date().toISOString()}] Marché fermé (week-end), scan de nouveaux signaux ignoré.`);
         return;
     }
- 
+
     if (!isWithinActiveHours()) {
         console.log(`[${new Date().toISOString()}] Hors fenêtre active (${ACTIVE_HOUR_START}h-${ACTIVE_HOUR_END}h Paris), scan ignoré.`);
         return;
     }
- 
+
     console.log(`[${new Date().toISOString()}] Début du scan...`);
     scanCount++;
- 
+
     const candlesByPairTf = await fetchAllCandles();
     const detectedSignals = [];
- 
+
+    // NOTE: pas de restriction "1 trade par paire" pendant la phase de test —
+    // on laisse chaque combo produire ses signaux indépendamment pour pouvoir
+    // mesurer sa performance propre. À réactiver le jour du passage en réel
+    // (sinon: plusieurs positions simultanées sur une même devise = risque
+    // concentré, cf. les 2 AUD/USD perdants du 13/07).
+
     for (const combo of COMBOS) {
         const candles = candlesByPairTf[combo.pair]?.[combo.timeframe];
         if (!candles || candles.length < 100) {
             console.log(`  ⚠️ ${combo.pair} ${combo.timeframe}: données insuffisantes, combo ignoré.`);
             continue;
         }
- 
+
         const allSignals = computeAllSignals(candles);
         const matches = comboMatches(allSignals, combo.signals);
- 
+
         if (matches) {
             // Anti-duplication: ne pas re-signaler la même paire/direction
             // si un signal a déjà été émis il y a moins d'1h
@@ -264,13 +308,23 @@ async function runScan() {
                 console.log(`  ⏭️ ${combo.pair} ${combo.direction}: déjà signalé il y a moins d'1h, ignoré.`);
                 continue;
             }
- 
+
             const slTp = computeSlTp(candles, combo.direction);
             if (!slTp) {
                 console.log(`  ⚠️ ${combo.pair} ${combo.direction}: ATR invalide, signal ignoré.`);
                 continue;
             }
- 
+
+            // Filtre SL minimum: si le SL est trop serré face au spread de la
+            // paire, le ratio réel s'effondre et le trade n'a aucun edge.
+            // On rejette le signal SANS toucher à la formule SL/TP.
+            const slPips = slDistancePips(combo.pair, slTp.entryPrice, slTp.sl);
+            const minSl = minSlPips(combo.pair);
+            if (minSl > 0 && slPips < minSl) {
+                console.log(`  🚫 ${combo.pair} ${combo.direction}: SL trop serré (${slPips.toFixed(1)} pips < ${minSl.toFixed(1)} min, spread ${SPREADS_PIPS[combo.pair]}p) — pas d'edge après spread, signal rejeté.`);
+                continue;
+            }
+
             const signalRecord = {
                 pair: combo.pair,
                 direction: combo.direction,
@@ -281,21 +335,21 @@ async function runScan() {
                 tp: slTp.tp,
                 atr: slTp.atr,
             };
- 
+
             console.log(`  ✅ SIGNAL: ${combo.pair} ${combo.direction} [${combo.timeframe}] entrée=${slTp.entryPrice.toFixed(5)} SL=${slTp.sl.toFixed(5)} TP=${slTp.tp.toFixed(5)}`);
- 
+
             await logSignal(signalRecord);
             await setLastSignalTime(combo.pair, combo.direction, now);
             detectedSignals.push(signalRecord);
         }
     }
- 
+
     lastScanResults = { timestamp: new Date().toISOString(), signals: detectedSignals };
     console.log(`[${new Date().toISOString()}] Scan terminé: ${detectedSignals.length} signal(aux) détecté(s).`);
 }
- 
+
 // ─── ENDPOINTS HTTP ────────────────────────────────────────────────────────────
- 
+
 app.get('/', (req, res) => {
     res.json({
         status: 'MEGA server actif',
@@ -308,15 +362,15 @@ app.get('/', (req, res) => {
         dernier_scan: lastScanResults,
     });
 });
- 
+
 app.get('/status', (req, res) => {
     res.json(lastScanResults);
 });
- 
+
 app.get('/combos', (req, res) => {
     res.json(COMBOS);
 });
- 
+
 app.all('/reset', async (req, res) => {
     try {
         await fetch(`${FIREBASE_URL}/mega/signals.json`, { method: 'DELETE' });
@@ -329,7 +383,7 @@ app.all('/reset', async (req, res) => {
         res.status(500).json({ status: 'error', message: e.message });
     }
 });
- 
+
 app.all('/recheck-all', async (req, res) => {
     // Re-vérifie TOUS les trades déjà clôturés (result WIN/LOSS) avec la
     // logique chronologique par bougies, et corrige ceux dont le résultat
@@ -348,18 +402,18 @@ app.all('/recheck-all', async (req, res) => {
     } catch (e) {
         return res.status(500).json({ status: 'error', message: e.message });
     }
- 
+
     const decodePair = p => p.replace('_', '/');
     const corrections = [];
     let checked = 0, errors = 0;
- 
+
     // Regroupe par paire pour minimiser les requêtes
     const byPair = {};
     for (const s of signals) {
         const pair = decodePair(s.pair);
         (byPair[pair] = byPair[pair] || []).push(s);
     }
- 
+
     for (const [pair, sigs] of Object.entries(byPair)) {
         const earliestTs = Math.min(...sigs.map(s => new Date(s.timestamp).getTime()));
         let candles;
@@ -371,17 +425,17 @@ app.all('/recheck-all', async (req, res) => {
             continue;
         }
         if (!candles.length) continue;
- 
+
         for (const signal of sigs) {
             checked++;
             const entryTs = new Date(signal.timestamp).getTime();
             const postEntry = candles.filter(c => new Date(c.datetime).getTime() > entryTs);
             if (!postEntry.length) continue;
- 
+
             const tp = parseFloat(signal.tp);
             const sl = parseFloat(signal.sl);
             let trueResult = null, closePrice = null, closeDate = null;
- 
+
             for (const c of postEntry) {
                 const high = parseFloat(c.high);
                 const low = parseFloat(c.low);
@@ -393,7 +447,7 @@ app.all('/recheck-all', async (req, res) => {
                     if (high >= sl) { trueResult = 'LOSS'; closePrice = sl; closeDate = c.datetime; break; }
                 }
             }
- 
+
             if (trueResult && trueResult !== signal.result) {
                 try {
                     await fetch(`${FIREBASE_URL}/mega/signals/${signal._fbKey}.json`, {
@@ -414,18 +468,17 @@ app.all('/recheck-all', async (req, res) => {
             }
         }
     }
- 
+
     console.log(`[${new Date().toISOString()}] Recheck-all terminé: ${checked} vérifiés, ${corrections.length} corrigés, ${errors} erreurs.`);
     res.json({ status: 'ok', verifies: checked, corriges: corrections.length, erreurs: errors, corrections });
 });
- 
+
 app.listen(PORT, () => {
     console.log(`MEGA server démarré sur le port ${PORT}`);
     console.log(`${COMBOS.length} combos actifs sur ${PAIRS.length} paires`);
     console.log(`Fenêtre active: ${ACTIVE_HOUR_START}h-${ACTIVE_HOUR_END}h Paris, scan toutes les ${SCAN_INTERVAL_MS / 60000} min`);
- 
+
     // Premier scan immédiat au démarrage, puis boucle régulière
     runScan();
     setInterval(runScan, SCAN_INTERVAL_MS);
 });
- 
