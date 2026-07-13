@@ -473,6 +473,60 @@ app.all('/recheck-all', async (req, res) => {
     res.json({ status: 'ok', verifies: checked, corriges: corrections.length, erreurs: errors, corrections });
 });
 
+app.all('/analyse-filtre', async (req, res) => {
+    // Rejoue le filtre SL sur l'historique RÉEL des trades MEGA déjà clôturés,
+    // pour mesurer empiriquement son effet — plus fiable qu'un backtest, car
+    // basé sur les trades réellement pris en live.
+    let signals;
+    try {
+        const r = await fetch(`${FIREBASE_URL}/mega/signals.json`);
+        const data = await r.json();
+        signals = data
+            ? Object.values(data).filter(s => s.result === 'WIN' || s.result === 'LOSS')
+            : [];
+    } catch (e) {
+        return res.status(500).json({ status: 'error', message: e.message });
+    }
+
+    const gardes = [], rejetes = [];
+    const parPaire = {};
+
+    for (const s of signals) {
+        const pair = s.pair;
+        const entry = parseFloat(s.entry_price);
+        const sl = parseFloat(s.sl);
+        if (!isFinite(entry) || !isFinite(sl)) continue;
+
+        const slPips = slDistancePips(pair, entry, sl);
+        const minSl = minSlPips(pair);
+        const rejete = minSl > 0 && slPips < minSl;
+
+        (rejete ? rejetes : gardes).push(s);
+
+        if (!parPaire[pair]) parPaire[pair] = { gardes: { w: 0, t: 0 }, rejetes: { w: 0, t: 0 } };
+        const bucket = rejete ? parPaire[pair].rejetes : parPaire[pair].gardes;
+        bucket.t++;
+        if (s.result === 'WIN') bucket.w++;
+    }
+
+    const wr = arr => arr.length
+        ? Math.round(arr.filter(s => s.result === 'WIN').length / arr.length * 100)
+        : null;
+
+    const resultat = {
+        total_analyses: gardes.length + rejetes.length,
+        gardes: { trades: gardes.length, wins: gardes.filter(s => s.result === 'WIN').length, win_rate: wr(gardes) },
+        rejetes: { trades: rejetes.length, wins: rejetes.filter(s => s.result === 'WIN').length, win_rate: wr(rejetes) },
+        seuils_utilises: Object.fromEntries(
+            Object.entries(SPREADS_PIPS).map(([p, sp]) => [p, `SL min ${(sp * SL_SPREAD_MULTIPLE).toFixed(1)} pips (spread ${sp}p)`])
+        ),
+        detail_par_paire: parPaire,
+    };
+
+    console.log(`[${new Date().toISOString()}] Analyse filtre: ${gardes.length} gardés (WR ${resultat.gardes.win_rate}%) / ${rejetes.length} rejetés (WR ${resultat.rejetes.win_rate}%)`);
+    res.json(resultat);
+});
+
 app.listen(PORT, () => {
     console.log(`MEGA server démarré sur le port ${PORT}`);
     console.log(`${COMBOS.length} combos actifs sur ${PAIRS.length} paires`);
