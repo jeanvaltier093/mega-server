@@ -315,15 +315,24 @@ async function runScan() {
                 continue;
             }
 
-            // Filtre SL minimum: si le SL est trop serré face au spread de la
-            // paire, le ratio réel s'effondre et le trade n'a aucun edge.
-            // On rejette le signal SANS toucher à la formule SL/TP.
-            const slPips = slDistancePips(combo.pair, slTp.entryPrice, slTp.sl);
-            const minSl = minSlPips(combo.pair);
-            if (minSl > 0 && slPips < minSl) {
-                console.log(`  🚫 ${combo.pair} ${combo.direction}: SL trop serré (${slPips.toFixed(1)} pips < ${minSl.toFixed(1)} min, spread ${SPREADS_PIPS[combo.pair]}p) — pas d'edge après spread, signal rejeté.`);
-                continue;
-            }
+            // FILTRE SL MINIMUM — DÉSACTIVÉ.
+            // L'hypothèse était: SL serré + spread = pas d'edge -> rejeter.
+            // Les données RÉELLES (98 trades) disent le contraire:
+            //   SL serré (56 trades) -> WR 61%
+            //   SL large (42 trades) -> WR 48%
+            // Raison: un SL serré implique un TP serré, donc plus facile à
+            // atteindre. Le WR plus élevé compense la dégradation du ratio par
+            // le spread. Le filtre supprimait donc les MEILLEURS trades
+            // (AUD/USD, USD/CAD) et gardait les pires (USD/JPY, GBP/USD).
+            // Voir /analyse-filtre pour l'espérance nette réelle après spread.
+            // Pour réactiver: décommenter le bloc ci-dessous.
+            //
+            // const slPips = slDistancePips(combo.pair, slTp.entryPrice, slTp.sl);
+            // const minSl = minSlPips(combo.pair);
+            // if (minSl > 0 && slPips < minSl) {
+            //     console.log(`  🚫 ${combo.pair} ${combo.direction}: SL trop serré (${slPips.toFixed(1)} pips < ${minSl.toFixed(1)} min) — rejeté.`);
+            //     continue;
+            // }
 
             const signalRecord = {
                 pair: combo.pair,
@@ -474,9 +483,14 @@ app.all('/recheck-all', async (req, res) => {
 });
 
 app.all('/analyse-filtre', async (req, res) => {
-    // Rejoue le filtre SL sur l'historique RÉEL des trades MEGA déjà clôturés,
-    // pour mesurer empiriquement son effet — plus fiable qu'un backtest, car
-    // basé sur les trades réellement pris en live.
+    // Espérance NETTE après spread, sur les trades MEGA réellement clôturés.
+    //
+    // Le win rate seul ne suffit pas à décider: un SL serré donne un WR plus
+    // élevé (TP plus facile à atteindre) mais un ratio dégradé par le spread.
+    // Un SL large donne l'inverse. Seule l'espérance en pips NETS tranche.
+    //
+    //   WIN  -> gain réel  = distance_TP - spread
+    //   LOSS -> perte réelle = distance_SL + spread
     let signals;
     try {
         const r = await fetch(`${FIREBASE_URL}/mega/signals.json`);
@@ -488,43 +502,69 @@ app.all('/analyse-filtre', async (req, res) => {
         return res.status(500).json({ status: 'error', message: e.message });
     }
 
-    const gardes = [], rejetes = [];
+    const mkBucket = () => ({ trades: 0, wins: 0, pips_nets: 0 });
+    const groupes = { sl_serre: mkBucket(), sl_large: mkBucket() };
     const parPaire = {};
+    const parCombo = {}; // paire + direction
 
     for (const s of signals) {
         const pair = s.pair;
+        const spread = SPREADS_PIPS[pair];
+        if (spread === undefined) continue;
+
         const entry = parseFloat(s.entry_price);
         const sl = parseFloat(s.sl);
-        if (!isFinite(entry) || !isFinite(sl)) continue;
+        const tp = parseFloat(s.tp);
+        if (!isFinite(entry) || !isFinite(sl) || !isFinite(tp)) continue;
 
         const slPips = slDistancePips(pair, entry, sl);
-        const minSl = minSlPips(pair);
-        const rejete = minSl > 0 && slPips < minSl;
+        const tpPips = slDistancePips(pair, entry, tp); // même calcul de distance
+        if (!isFinite(slPips) || slPips <= 0) continue;
 
-        (rejete ? rejetes : gardes).push(s);
+        // Pips NETS réellement encaissés/perdus, spread déduit
+        const pipsNets = s.result === 'WIN' ? (tpPips - spread) : -(slPips + spread);
 
-        if (!parPaire[pair]) parPaire[pair] = { gardes: { w: 0, t: 0 }, rejetes: { w: 0, t: 0 } };
-        const bucket = rejete ? parPaire[pair].rejetes : parPaire[pair].gardes;
-        bucket.t++;
-        if (s.result === 'WIN') bucket.w++;
+        const serre = slPips < minSlPips(pair);
+        const g = serre ? groupes.sl_serre : groupes.sl_large;
+        g.trades++; g.pips_nets += pipsNets;
+        if (s.result === 'WIN') g.wins++;
+
+        if (!parPaire[pair]) parPaire[pair] = mkBucket();
+        parPaire[pair].trades++; parPaire[pair].pips_nets += pipsNets;
+        if (s.result === 'WIN') parPaire[pair].wins++;
+
+        const ck = `${pair}_${s.direction}`;
+        if (!parCombo[ck]) parCombo[ck] = mkBucket();
+        parCombo[ck].trades++; parCombo[ck].pips_nets += pipsNets;
+        if (s.result === 'WIN') parCombo[ck].wins++;
     }
 
-    const wr = arr => arr.length
-        ? Math.round(arr.filter(s => s.result === 'WIN').length / arr.length * 100)
-        : null;
+    // Finalise un bucket: WR, pips nets totaux, espérance par trade
+    const fin = b => ({
+        trades: b.trades,
+        win_rate: b.trades ? Math.round(b.wins / b.trades * 100) : null,
+        pips_nets_total: Math.round(b.pips_nets * 10) / 10,
+        esperance_par_trade: b.trades ? Math.round(b.pips_nets / b.trades * 100) / 100 : null,
+    });
 
-    const resultat = {
-        total_analyses: gardes.length + rejetes.length,
-        gardes: { trades: gardes.length, wins: gardes.filter(s => s.result === 'WIN').length, win_rate: wr(gardes) },
-        rejetes: { trades: rejetes.length, wins: rejetes.filter(s => s.result === 'WIN').length, win_rate: wr(rejetes) },
-        seuils_utilises: Object.fromEntries(
-            Object.entries(SPREADS_PIPS).map(([p, sp]) => [p, `SL min ${(sp * SL_SPREAD_MULTIPLE).toFixed(1)} pips (spread ${sp}p)`])
-        ),
-        detail_par_paire: parPaire,
+    const finTrie = obj => Object.fromEntries(
+        Object.entries(obj)
+            .map(([k, b]) => [k, fin(b)])
+            .sort((a, b) => (b[1].esperance_par_trade ?? -99) - (a[1].esperance_par_trade ?? -99))
+    );
+
+    const out = {
+        lecture: "esperance_par_trade = pips nets moyens par trade, spread déduit. POSITIF = rentable, NÉGATIF = perd de l'argent.",
+        global: fin(Object.values(groupes).reduce((a, b) => ({
+            trades: a.trades + b.trades, wins: a.wins + b.wins, pips_nets: a.pips_nets + b.pips_nets,
+        }), mkBucket())),
+        par_groupe_SL: { sl_serre: fin(groupes.sl_serre), sl_large: fin(groupes.sl_large) },
+        par_combo: finTrie(parCombo),
+        par_paire: finTrie(parPaire),
     };
 
-    console.log(`[${new Date().toISOString()}] Analyse filtre: ${gardes.length} gardés (WR ${resultat.gardes.win_rate}%) / ${rejetes.length} rejetés (WR ${resultat.rejetes.win_rate}%)`);
-    res.json(resultat);
+    console.log(`[${new Date().toISOString()}] Analyse espérance: global ${out.global.esperance_par_trade} pips/trade`);
+    res.json(out);
 });
 
 app.listen(PORT, () => {
