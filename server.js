@@ -502,7 +502,7 @@ app.all('/analyse-filtre', async (req, res) => {
         return res.status(500).json({ status: 'error', message: e.message });
     }
 
-    const mkBucket = () => ({ trades: 0, wins: 0, pips_nets: 0 });
+    const mkBucket = () => ({ trades: 0, wins: 0, pips_nets: 0, R: 0 });
     const groupes = { sl_serre: mkBucket(), sl_large: mkBucket() };
     const parPaire = {};
     const parCombo = {}; // paire + direction
@@ -518,53 +518,152 @@ app.all('/analyse-filtre', async (req, res) => {
         if (!isFinite(entry) || !isFinite(sl) || !isFinite(tp)) continue;
 
         const slPips = slDistancePips(pair, entry, sl);
-        const tpPips = slDistancePips(pair, entry, tp); // même calcul de distance
+        const tpPips = slDistancePips(pair, entry, tp);
         if (!isFinite(slPips) || slPips <= 0) continue;
 
         // Pips NETS réellement encaissés/perdus, spread déduit
         const pipsNets = s.result === 'WIN' ? (tpPips - spread) : -(slPips + spread);
 
+        // IMPORTANT — mesure en R (multiples de risque):
+        // l'exécuteur IG dimensionne chaque position pour risquer 20€ FIXES.
+        // Une perte de 30 pips (SL large) coûte donc autant qu'une perte de
+        // 3 pips (SL serré): 20€. Compter en pips bruts surpondère donc les
+        // trades à SL large. La vraie mesure économique est le multiple de
+        // risque: R = pips_nets / risque_reel_en_pips (= SL + spread).
+        const risquePips = slPips + spread;
+        const R = pipsNets / risquePips; // LOSS -> -1.00 ; WIN -> +(TP-spread)/(SL+spread)
+
         const serre = slPips < minSlPips(pair);
         const g = serre ? groupes.sl_serre : groupes.sl_large;
-        g.trades++; g.pips_nets += pipsNets;
+        g.trades++; g.pips_nets += pipsNets; g.R += R;
         if (s.result === 'WIN') g.wins++;
 
         if (!parPaire[pair]) parPaire[pair] = mkBucket();
-        parPaire[pair].trades++; parPaire[pair].pips_nets += pipsNets;
+        parPaire[pair].trades++; parPaire[pair].pips_nets += pipsNets; parPaire[pair].R += R;
         if (s.result === 'WIN') parPaire[pair].wins++;
 
         const ck = `${pair}_${s.direction}`;
         if (!parCombo[ck]) parCombo[ck] = mkBucket();
-        parCombo[ck].trades++; parCombo[ck].pips_nets += pipsNets;
+        parCombo[ck].trades++; parCombo[ck].pips_nets += pipsNets; parCombo[ck].R += R;
         if (s.result === 'WIN') parCombo[ck].wins++;
     }
 
-    // Finalise un bucket: WR, pips nets totaux, espérance par trade
+    const RISQUE_EUR = 20; // doit correspondre à RISK_PER_TRADE de l'exécuteur IG
+
+    // Finalise un bucket. La métrique qui DÉCIDE est esperance_R (et son
+    // équivalent en euros); les pips ne sont donnés qu'à titre indicatif.
     const fin = b => ({
         trades: b.trades,
         win_rate: b.trades ? Math.round(b.wins / b.trades * 100) : null,
+        esperance_R: b.trades ? Math.round(b.R / b.trades * 1000) / 1000 : null,
+        esperance_EUR: b.trades ? Math.round(b.R / b.trades * RISQUE_EUR * 100) / 100 : null,
+        total_EUR: Math.round(b.R * RISQUE_EUR * 100) / 100,
         pips_nets_total: Math.round(b.pips_nets * 10) / 10,
-        esperance_par_trade: b.trades ? Math.round(b.pips_nets / b.trades * 100) / 100 : null,
     });
 
     const finTrie = obj => Object.fromEntries(
         Object.entries(obj)
             .map(([k, b]) => [k, fin(b)])
-            .sort((a, b) => (b[1].esperance_par_trade ?? -99) - (a[1].esperance_par_trade ?? -99))
+            .sort((a, b) => (b[1].esperance_R ?? -99) - (a[1].esperance_R ?? -99))
     );
 
     const out = {
-        lecture: "esperance_par_trade = pips nets moyens par trade, spread déduit. POSITIF = rentable, NÉGATIF = perd de l'argent.",
+        lecture: `esperance_EUR = gain/perte moyen par trade en euros (risque ${RISQUE_EUR}€/trade, spread déduit). POSITIF = rentable. C'est LA métrique qui décide — pas les pips, car le sizing normalise le risque.`,
         global: fin(Object.values(groupes).reduce((a, b) => ({
-            trades: a.trades + b.trades, wins: a.wins + b.wins, pips_nets: a.pips_nets + b.pips_nets,
+            trades: a.trades + b.trades, wins: a.wins + b.wins,
+            pips_nets: a.pips_nets + b.pips_nets, R: a.R + b.R,
         }), mkBucket())),
         par_groupe_SL: { sl_serre: fin(groupes.sl_serre), sl_large: fin(groupes.sl_large) },
         par_combo: finTrie(parCombo),
         par_paire: finTrie(parPaire),
     };
 
-    console.log(`[${new Date().toISOString()}] Analyse espérance: global ${out.global.esperance_par_trade} pips/trade`);
+    console.log(`[${new Date().toISOString()}] Analyse: global ${out.global.esperance_EUR}€/trade (${out.global.total_EUR}€ au total)`);
     res.json(out);
+});
+
+app.all('/purge', async (req, res) => {
+    // Supprime les signaux MEGA dont le timestamp tombe dans une fenêtre.
+    // Paramètres (heure de PARIS):
+    //   ?from=2026-07-13T17:00&to=2026-07-14T15:20
+    //   &confirm=oui   -> exécute réellement la suppression
+    // SANS &confirm=oui, la route ne fait qu'un APERÇU (aucune suppression).
+    const { from, to, confirm } = req.query;
+    if (!from || !to) {
+        return res.status(400).json({
+            status: 'error',
+            message: "Paramètres 'from' et 'to' requis (heure de Paris). Ex: /purge?from=2026-07-13T17:00&to=2026-07-14T15:20",
+        });
+    }
+
+    // Interprète les dates fournies comme de l'heure de PARIS.
+    // Méthode fiable: on prend la date en supposant UTC, puis on mesure le
+    // décalage réel de Paris à cet instant (gère été/hiver) et on l'applique.
+    const parisToUtc = (str) => {
+        const naive = new Date(str.length <= 16 ? str + ':00Z' : str + 'Z');
+        if (isNaN(naive)) return null;
+        // Que vaut cet instant UTC lu en heure de Paris ?
+        const asParis = new Date(naive.toLocaleString('en-US', { timeZone: 'Europe/Paris' }));
+        const asUtc = new Date(naive.toLocaleString('en-US', { timeZone: 'UTC' }));
+        const offsetMs = asParis - asUtc; // +2h en été, +1h en hiver
+        return new Date(naive.getTime() - offsetMs);
+    };
+
+    const fromDate = parisToUtc(from);
+    const toDate = parisToUtc(to);
+    if (!fromDate || !toDate) {
+        return res.status(400).json({ status: 'error', message: 'Dates invalides. Format attendu: 2026-07-13T17:00' });
+    }
+
+    let data;
+    try {
+        const r = await fetch(`${FIREBASE_URL}/mega/signals.json`);
+        data = await r.json();
+    } catch (e) {
+        return res.status(500).json({ status: 'error', message: e.message });
+    }
+    if (!data) return res.json({ status: 'ok', message: 'Aucun signal en base.', supprimes: 0 });
+
+    const cibles = [];
+    for (const [key, s] of Object.entries(data)) {
+        const ts = new Date(s.timestamp).getTime();
+        if (!isFinite(ts)) continue;
+        if (ts >= fromDate.getTime() && ts <= toDate.getTime()) {
+            cibles.push({
+                key,
+                pair: s.pair,
+                direction: s.direction,
+                result: s.result ?? 'ACTIF',
+                timestamp: s.timestamp,
+                heure_paris: new Date(s.timestamp).toLocaleString('fr-FR', { timeZone: 'Europe/Paris' }),
+            });
+        }
+    }
+
+    // Sécurité: sans confirm=oui, on ne fait qu'un aperçu.
+    if (confirm !== 'oui') {
+        return res.json({
+            status: 'APERCU',
+            message: `${cibles.length} signal(aux) SERAIENT supprimés. Rien n'a été supprimé. Pour exécuter, rajoute &confirm=oui à l'URL.`,
+            fenetre_paris: { from, to },
+            fenetre_utc: { from: fromDate.toISOString(), to: toDate.toISOString() },
+            a_supprimer: cibles,
+        });
+    }
+
+    let supprimes = 0, erreurs = 0;
+    for (const c of cibles) {
+        try {
+            await fetch(`${FIREBASE_URL}/mega/signals/${c.key}.json`, { method: 'DELETE' });
+            supprimes++;
+        } catch (e) {
+            erreurs++;
+            console.error(`purge: erreur suppression ${c.key}:`, e.message);
+        }
+    }
+
+    console.log(`[${new Date().toISOString()}] PURGE: ${supprimes} signaux supprimés (${from} -> ${to} Paris), ${erreurs} erreurs.`);
+    res.json({ status: 'ok', supprimes, erreurs, fenetre_paris: { from, to }, details: cibles });
 });
 
 app.listen(PORT, () => {
