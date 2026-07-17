@@ -23,6 +23,23 @@ const ACTIVE_HOUR_START = 8;  // heure Paris (Europe/Paris, gère heure d'été/
 const ACTIVE_HOUR_END = 22;   // heure Paris de fin de fenêtre active
 const MIN_RESCAN_GAP_MS = 60 * 60 * 1000; // anti-duplication: pas 2 fois le même signal en moins d'1h
 
+// ─── CLÉS TWELVE DATA (jour vs nuit) ──────────────────────────────────────────
+// Chaque clé gratuite est limitée à 800 req/jour. Le scan jour (~700 req) et le
+// scan nuit (~600 req) ne rentrent pas sur une seule clé. On dédie donc une clé
+// par session pour rester sous le quota de chacune.
+//   - Jour : la clé du scan (celle de twelvedata.js, d3fa411...)
+//   - Nuit : une 3e clé dédiée
+const { TWELVE_KEY: DAY_KEY } = require('./twelvedata.js');
+const NIGHT_KEY = process.env.TWELVE_NIGHT_KEY || '30657c93a300488e8d7e593562f28cbc';
+
+// ─── FENÊTRE NUIT ─────────────────────────────────────────────────────────────
+// Le jour = 8h-22h (exécuté sur IG). La nuit = 22h-8h, scannée UNIQUEMENT pour
+// collecter des statistiques comparatives (session:"nuit"). Les signaux de nuit
+// NE SONT PAS exécutés sur IG (l'exécuteur les ignore) tant qu'on n'a pas la
+// preuve que la nuit est rentable — le spread nocturne est bien plus large.
+const NIGHT_HOUR_START = 22; // 22h Paris
+const NIGHT_HOUR_END = 8;    // 8h Paris
+
 // ─── FILTRE SL MINIMUM (protection contre le spread) ──────────────────────────
 // Le spread est un coût FIXE en pips. Sur un SL serré il représente une part
 // énorme du risque et détruit le ratio réel:
@@ -74,6 +91,17 @@ function isWithinActiveHours() {
         10
     );
     return heureParis >= ACTIVE_HOUR_START && heureParis < ACTIVE_HOUR_END;
+}
+
+// Retourne la session courante selon l'heure de Paris:
+//   "jour"  entre 8h et 22h   -> scan sur clé jour, exécuté sur IG
+//   "nuit"  entre 22h et 8h   -> scan sur clé nuit, stats seulement
+function currentSession() {
+    const heureParis = parseInt(
+        new Intl.DateTimeFormat('fr-FR', { timeZone: 'Europe/Paris', hour: '2-digit', hour12: false }).format(new Date()),
+        10
+    );
+    return (heureParis >= ACTIVE_HOUR_START && heureParis < ACTIVE_HOUR_END) ? 'jour' : 'nuit';
 }
 
 // Le marché forex est fermé le week-end (du vendredi ~22h au dimanche ~23h
@@ -131,14 +159,14 @@ async function waitForRateLimit() {
     requestTimestamps.push(Date.now());
 }
 
-async function fetchAllCandles() {
+async function fetchAllCandles(apiKey) {
     const candlesByPairTf = {};
     for (const [pair, tfs] of Object.entries(PAIR_TIMEFRAMES)) {
         candlesByPairTf[pair] = {};
         for (const tf of tfs) {
             await waitForRateLimit();
             try {
-                const candles = await fetchCandles(pair, tf);
+                const candles = await fetchCandles(pair, tf, 150, apiKey);
                 candlesByPairTf[pair][tf] = candles;
             } catch (e) {
                 console.error(`Erreur fetch ${pair} ${tf}:`, e.message);
@@ -151,7 +179,11 @@ async function fetchAllCandles() {
 }
 
 const FIREBASE_URL = process.env.FIREBASE_URL || 'https://forex-trading-bendo-default-rtdb.firebaseio.com';
-const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || '80ddd35489f3427d8c43f29c995d6372';
+// Clé dédiée à la vérification des trades (checkTrades). Distincte de la clé de
+// scan jour (twelvedata.js) et de la clé nuit, pour ne pas cumuler les quotas.
+// Variable propre (CHECK_TWELVE_KEY) afin d'éviter toute collision si
+// TWELVE_DATA_API_KEY est définie sur Render pour le scan.
+const TWELVE_DATA_API_KEY = process.env.CHECK_TWELVE_KEY || '80ddd35489f3427d8c43f29c995d6372';
 
 async function fetchCandlesSince(pair, sinceMs, interval = '15min') {
     await waitForRateLimit();
@@ -272,22 +304,21 @@ async function runScan() {
         return;
     }
 
-    if (!isWithinActiveHours()) {
-        console.log(`[${new Date().toISOString()}] Hors fenêtre active (${ACTIVE_HOUR_START}h-${ACTIVE_HOUR_END}h Paris), scan ignoré.`);
-        return;
-    }
+    // On scanne DÉSORMAIS 24h/24 (jour ET nuit). La session détermine:
+    //   - quelle clé Twelve Data utiliser (quota séparé par clé)
+    //   - le tag "session" du signal (jour = exécuté IG, nuit = stats seulement)
+    const session = currentSession();
+    const apiKey = session === 'jour' ? DAY_KEY : NIGHT_KEY;
 
-    console.log(`[${new Date().toISOString()}] Début du scan...`);
+    console.log(`[${new Date().toISOString()}] Début du scan [${session}]...`);
     scanCount++;
 
-    const candlesByPairTf = await fetchAllCandles();
+    const candlesByPairTf = await fetchAllCandles(apiKey);
     const detectedSignals = [];
 
-    // NOTE: pas de restriction "1 trade par paire" pendant la phase de test —
-    // on laisse chaque combo produire ses signaux indépendamment pour pouvoir
-    // mesurer sa performance propre. À réactiver le jour du passage en réel
-    // (sinon: plusieurs positions simultanées sur une même devise = risque
-    // concentré, cf. les 2 AUD/USD perdants du 13/07).
+    // NOTE: pas de restriction "1 trade par paire" côté serveur pendant la phase
+    // de test — chaque combo produit ses signaux indépendamment pour mesurer sa
+    // performance propre. Le "1 trade/paire" est géré côté exécuteur IG.
 
     for (const combo of COMBOS) {
         const candles = candlesByPairTf[combo.pair]?.[combo.timeframe];
@@ -315,25 +346,6 @@ async function runScan() {
                 continue;
             }
 
-            // FILTRE SL MINIMUM — DÉSACTIVÉ.
-            // L'hypothèse était: SL serré + spread = pas d'edge -> rejeter.
-            // Les données RÉELLES (98 trades) disent le contraire:
-            //   SL serré (56 trades) -> WR 61%
-            //   SL large (42 trades) -> WR 48%
-            // Raison: un SL serré implique un TP serré, donc plus facile à
-            // atteindre. Le WR plus élevé compense la dégradation du ratio par
-            // le spread. Le filtre supprimait donc les MEILLEURS trades
-            // (AUD/USD, USD/CAD) et gardait les pires (USD/JPY, GBP/USD).
-            // Voir /analyse-filtre pour l'espérance nette réelle après spread.
-            // Pour réactiver: décommenter le bloc ci-dessous.
-            //
-            // const slPips = slDistancePips(combo.pair, slTp.entryPrice, slTp.sl);
-            // const minSl = minSlPips(combo.pair);
-            // if (minSl > 0 && slPips < minSl) {
-            //     console.log(`  🚫 ${combo.pair} ${combo.direction}: SL trop serré (${slPips.toFixed(1)} pips < ${minSl.toFixed(1)} min) — rejeté.`);
-            //     continue;
-            // }
-
             const signalRecord = {
                 pair: combo.pair,
                 direction: combo.direction,
@@ -343,9 +355,10 @@ async function runScan() {
                 sl: slTp.sl,
                 tp: slTp.tp,
                 atr: slTp.atr,
+                session, // "jour" ou "nuit" — l'exécuteur IG n'ouvre QUE les "jour"
             };
 
-            console.log(`  ✅ SIGNAL: ${combo.pair} ${combo.direction} [${combo.timeframe}] entrée=${slTp.entryPrice.toFixed(5)} SL=${slTp.sl.toFixed(5)} TP=${slTp.tp.toFixed(5)}`);
+            console.log(`  ✅ SIGNAL [${session}]: ${combo.pair} ${combo.direction} [${combo.timeframe}] entrée=${slTp.entryPrice.toFixed(5)} SL=${slTp.sl.toFixed(5)} TP=${slTp.tp.toFixed(5)}`);
 
             await logSignal(signalRecord);
             await setLastSignalTime(combo.pair, combo.direction, now);
@@ -353,8 +366,8 @@ async function runScan() {
         }
     }
 
-    lastScanResults = { timestamp: new Date().toISOString(), signals: detectedSignals };
-    console.log(`[${new Date().toISOString()}] Scan terminé: ${detectedSignals.length} signal(aux) détecté(s).`);
+    lastScanResults = { timestamp: new Date().toISOString(), session, signals: detectedSignals };
+    console.log(`[${new Date().toISOString()}] Scan [${session}] terminé: ${detectedSignals.length} signal(aux) détecté(s).`);
 }
 
 // ─── ENDPOINTS HTTP ────────────────────────────────────────────────────────────
@@ -364,7 +377,10 @@ app.get('/', (req, res) => {
         status: 'MEGA server actif',
         combos_actifs: COMBOS.length,
         paires: PAIRS,
-        fenetre_active: `${ACTIVE_HOUR_START}h-${ACTIVE_HOUR_END}h Paris`,
+        mode: 'scan 24h/24',
+        session_courante: currentSession(),
+        fenetre_jour: `${ACTIVE_HOUR_START}h-${ACTIVE_HOUR_END}h Paris (exécuté sur IG)`,
+        fenetre_nuit: `${NIGHT_HOUR_START}h-${NIGHT_HOUR_END}h Paris (stats seulement)`,
         intervalle_scan_minutes: SCAN_INTERVAL_MS / 60000,
         scans_effectues: scanCount,
         erreurs: errorCount,
