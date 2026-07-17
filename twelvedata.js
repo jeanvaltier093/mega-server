@@ -8,13 +8,17 @@ const TF_TO_INTERVAL = { M15: '15min', M30: '30min', H1: '1h' };
  * Récupère les N dernières bougies CLOSED pour une paire/timeframe.
  * outputsize=150: largement suffisant pour tous les indicateurs (le plus
  * gourmand, hurst_exponent_rolling, a besoin de 100 bougies).
+ *
+ * apiKey optionnel: permet d'utiliser une clé différente selon le contexte
+ * (ex: clé de jour vs clé de nuit, pour ne pas dépasser le quota Twelve Data
+ * de 800 req/jour par clé). Par défaut, la clé de jour (TWELVE_KEY).
  */
-async function fetchCandles(pair, timeframe, outputsize = 150) {
+async function fetchCandles(pair, timeframe, outputsize = 150, apiKey = TWELVE_KEY) {
     const interval = TF_TO_INTERVAL[timeframe];
     if (!interval) throw new Error(`Timeframe inconnu: ${timeframe}`);
 
     const symbol = pair; // Twelve Data accepte le format "EUR/USD" directement
-    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVE_KEY}&format=JSON`;
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${outputsize}&apikey=${apiKey}&format=JSON`;
 
     const res = await fetch(url);
     const data = await res.json();
@@ -23,9 +27,6 @@ async function fetchCandles(pair, timeframe, outputsize = 150) {
         throw new Error(`Twelve Data erreur pour ${pair} ${timeframe}: ${data.message || JSON.stringify(data)}`);
     }
 
-    // Twelve Data renvoie du plus récent au plus ancien -> on inverse pour
-    // avoir l'ordre chronologique attendu par les indicateurs (le plus
-    // récent en dernier, comme dans le backtest Python).
     const candles = data.values
         .map(v => ({
             datetime: v.datetime,
