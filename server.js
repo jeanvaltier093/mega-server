@@ -199,6 +199,98 @@ async function fetchCandlesSince(pair, sinceMs, interval = '15min') {
 }
 
 /*
+ * DÉTECTION DE CLÔTURE ROBUSTE — remplace le simple "high>=tp / low<=sl".
+ *
+ * BUG CORRIGÉ (confirmé le 20/07 sur un USD/JPY): une bougie Twelve Data
+ * isolée et aberrante (donnée corrompue, pic de mèche, artefact de
+ * réouverture de marché) pouvait déclencher un WIN/LOSS qui n'a JAMAIS eu
+ * lieu en réalité — vérifié en comparant au prix réel IG, resté à des heures
+ * de distance du niveau soi-disant "touché". Même schéma observé sur un
+ * GBP/USD ayant traversé un week-end.
+ *
+ * Deux filtres indépendants et complémentaires:
+ *
+ *  1. PLAUSIBILITÉ — l'amplitude (high-low) de la bougie qui touche TP/SL ne
+ *     doit pas dépasser un multiple de l'ATR récent (14 bougies). Une bougie
+ *     anormalement large par rapport à la volatilité ambiante est traitée
+ *     comme une donnée suspecte et ignorée pour la détection (on continue
+ *     sur les bougies suivantes, on ne s'arrête pas dessus).
+ *
+ *  2. CONFIRMATION — même plausible, un simple attouchement ne suffit pas:
+ *     la bougie SUIVANTE doit rester du bon côté du niveau touché (son
+ *     high/low doit lui aussi dépasser le niveau, ou son close rester au-delà
+ *     d'une marge). Ça élimine les "wick and revert" — un artefact isolé qui
+ *     ne persiste pas dans les bougies suivantes, exactement le cas observé.
+ *
+ * Sans confirmation possible (dernière bougie de la série), on N'ACCEPTE PAS
+ * la clôture: mieux vaut attendre le prochain scan que déclarer un résultat
+ * non confirmé.
+ */
+function computeATR(candles, period = 14) {
+    if (candles.length < 2) return null;
+    const trs = [];
+    for (let i = 1; i < candles.length; i++) {
+        const h = parseFloat(candles[i].high), l = parseFloat(candles[i].low);
+        const pc = parseFloat(candles[i - 1].close);
+        trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+    }
+    const slice = trs.slice(-period);
+    return slice.reduce((a, b) => a + b, 0) / slice.length;
+}
+
+const PLAUSIBILITY_MAX_ATR_MULT = 4; // bougie rejetée si (high-low) > 4x l'ATR récent
+
+function detectClosure(direction, tp, sl, postEntry) {
+    for (let i = 0; i < postEntry.length; i++) {
+        const c = postEntry[i];
+        const high = parseFloat(c.high), low = parseFloat(c.low);
+
+        // Filtre 1 — PLAUSIBILITÉ : amplitude de la bougie vs ATR local
+        // (calculé sur les bougies précédant celle-ci dans la série).
+        const atr = computeATR(postEntry.slice(0, i + 1));
+        const amplitude = high - low;
+        if (atr && amplitude > atr * PLAUSIBILITY_MAX_ATR_MULT) {
+            continue; // bougie suspecte, on l'ignore et on continue la recherche
+        }
+
+        let touched = null; // 'WIN' | 'LOSS' | null
+        if (direction === 'BUY') {
+            if (high >= tp) touched = 'WIN';
+            else if (low <= sl) touched = 'LOSS';
+        } else {
+            if (low <= tp) touched = 'WIN';
+            else if (high >= sl) touched = 'LOSS';
+        }
+        if (!touched) continue;
+
+        // Filtre 2 — CONFIRMATION : soit la bougie suivante touche AUSSI le
+        // niveau (le mouvement persiste), soit la bougie de touche a CLÔTURÉ
+        // au-delà du niveau (pas juste une mèche fugace, confirmée par elle-
+        // même). Comparaison stricte sur le prix — PAS de tolérance en
+        // pourcentage, qui serait absurde entre paires JPY (~162) et EUR/USD
+        // (~1.14): 0.1% de 162 = 16 pips.
+        const next = postEntry[i + 1];
+        const nh = next ? parseFloat(next.high) : null;
+        const nl = next ? parseFloat(next.low) : null;
+        const cClose = parseFloat(c.close);
+        let selfConfirmed, nextConfirmed;
+        if (direction === 'BUY') {
+            selfConfirmed = touched === 'WIN' ? cClose >= tp : cClose <= sl;
+            nextConfirmed = next && (touched === 'WIN' ? nh >= tp : nl <= sl);
+        } else {
+            selfConfirmed = touched === 'WIN' ? cClose <= tp : cClose >= sl;
+            nextConfirmed = next && (touched === 'WIN' ? nl <= tp : nh >= sl);
+        }
+        if (selfConfirmed || nextConfirmed) {
+            return { result: touched, closePrice: touched === 'WIN' ? tp : sl, closeDate: c.datetime };
+        }
+        if (!next) return null; // pas encore de bougie suivante pour trancher, on attend le prochain scan
+        // sinon: ni auto-confirmé ni confirmé par la suivante -> artefact isolé, on continue la recherche
+    }
+    return null;
+}
+
+/*
  * Relit les trades actifs (result null/absent) depuis Firebase, et verifie
  * chaque bougie M15 depuis l'ouverture, DANS L'ORDRE CHRONOLOGIQUE, pour
  * trouver quel niveau (TP ou SL) a ete touche EN PREMIER.
@@ -259,19 +351,10 @@ async function checkTrades() {
 
             const tp = parseFloat(signal.tp);
             const sl = parseFloat(signal.sl);
-            let result = null, closePrice = null, closeDate = null;
-
-            for (const c of postEntry) {
-                const high = parseFloat(c.high);
-                const low = parseFloat(c.low);
-                if (signal.direction === 'BUY') {
-                    if (high >= tp) { result = 'WIN'; closePrice = tp; closeDate = c.datetime; break; }
-                    if (low <= sl) { result = 'LOSS'; closePrice = sl; closeDate = c.datetime; break; }
-                } else {
-                    if (low <= tp) { result = 'WIN'; closePrice = tp; closeDate = c.datetime; break; }
-                    if (high >= sl) { result = 'LOSS'; closePrice = sl; closeDate = c.datetime; break; }
-                }
-            }
+            const closure = detectClosure(signal.direction, tp, sl, postEntry);
+            const result = closure?.result ?? null;
+            const closePrice = closure?.closePrice ?? null;
+            const closeDate = closure?.closeDate ?? null;
 
             if (result) {
                 try {
@@ -459,19 +542,10 @@ app.all('/recheck-all', async (req, res) => {
 
             const tp = parseFloat(signal.tp);
             const sl = parseFloat(signal.sl);
-            let trueResult = null, closePrice = null, closeDate = null;
-
-            for (const c of postEntry) {
-                const high = parseFloat(c.high);
-                const low = parseFloat(c.low);
-                if (signal.direction === 'BUY') {
-                    if (high >= tp) { trueResult = 'WIN'; closePrice = tp; closeDate = c.datetime; break; }
-                    if (low <= sl) { trueResult = 'LOSS'; closePrice = sl; closeDate = c.datetime; break; }
-                } else {
-                    if (low <= tp) { trueResult = 'WIN'; closePrice = tp; closeDate = c.datetime; break; }
-                    if (high >= sl) { trueResult = 'LOSS'; closePrice = sl; closeDate = c.datetime; break; }
-                }
-            }
+            const closure = detectClosure(signal.direction, tp, sl, postEntry);
+            const trueResult = closure?.result ?? null;
+            const closePrice = closure?.closePrice ?? null;
+            const closeDate = closure?.closeDate ?? null;
 
             if (trueResult && trueResult !== signal.result) {
                 try {
